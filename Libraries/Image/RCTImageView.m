@@ -1,24 +1,23 @@
-/**
- * Copyright (c) 2015-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
-#import "RCTImageView.h"
+#import <React/RCTImageView.h>
 
-#import "RCTBridge.h"
-#import "RCTConvert.h"
-#import "RCTEventDispatcher.h"
-#import "RCTImageLoader.h"
-#import "RCTImageSource.h"
-#import "RCTImageUtils.h"
-#import "RCTUtils.h"
-#import "RCTImageBlurUtils.h"
+#import <React/RCTBridge.h>
+#import <React/RCTConvert.h>
+#import <React/RCTEventDispatcher.h>
+#import <React/RCTImageSource.h>
+#import <React/RCTUtils.h>
+#import <React/UIView+React.h>
 
-#import "UIView+React.h"
+#import <React/RCTUIImageViewAnimated.h>
+#import <React/RCTImageBlurUtils.h>
+#import <React/RCTImageUtils.h>
+#import <React/RCTImageLoaderProtocol.h>
 
 /**
  * Determines whether an image of `currentSize` should be reloaded for display
@@ -55,6 +54,7 @@ static NSDictionary *onLoadParamsForSource(RCTImageSource *source)
 @property (nonatomic, copy) RCTDirectEventBlock onLoadStart;
 @property (nonatomic, copy) RCTDirectEventBlock onProgress;
 @property (nonatomic, copy) RCTDirectEventBlock onError;
+@property (nonatomic, copy) RCTDirectEventBlock onPartialLoad;
 @property (nonatomic, copy) RCTDirectEventBlock onLoad;
 @property (nonatomic, copy) RCTDirectEventBlock onLoadEnd;
 
@@ -62,6 +62,7 @@ static NSDictionary *onLoadParamsForSource(RCTImageSource *source)
 
 @implementation RCTImageView
 {
+  // Weak reference back to the bridge, for image loading
   __weak RCTBridge *_bridge;
 
   // The image source that's currently displayed
@@ -70,22 +71,22 @@ static NSDictionary *onLoadParamsForSource(RCTImageSource *source)
   // The image source that's being loaded from the network
   RCTImageSource *_pendingImageSource;
 
-  // Size of the image loaded / being loaded, so we can determine when to issue
-  // a reload to accomodate a changing size.
+  // Size of the image loaded / being loaded, so we can determine when to issue a reload to accommodate a changing size.
   CGSize _targetSize;
 
-  /**
-   * A block that can be invoked to cancel the most recent call to -reloadImage,
-   * if any.
-   */
+  // A block that can be invoked to cancel the most recent call to -reloadImage, if any
   RCTImageLoaderCancellationBlock _reloadImageCancellationBlock;
+
+  // Whether the latest change of props requires the image to be reloaded
+  BOOL _needsReload;
+
+   RCTUIImageViewAnimated *_imageView;
 }
 
 - (instancetype)initWithBridge:(RCTBridge *)bridge
 {
-  if ((self = [super init])) {
+  if ((self = [super initWithFrame:CGRectZero])) {
     _bridge = bridge;
-
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserver:self
                selector:@selector(clearImageIfDetached)
@@ -95,21 +96,23 @@ static NSDictionary *onLoadParamsForSource(RCTImageSource *source)
                selector:@selector(clearImageIfDetached)
                    name:UIApplicationDidEnterBackgroundNotification
                  object:nil];
+    _imageView = [[RCTUIImageViewAnimated alloc] init];
+    _imageView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self addSubview:_imageView];
   }
   return self;
 }
 
-- (void)dealloc
-{
-  [[NSNotificationCenter defaultCenter] removeObserver:self];
-}
-
 RCT_NOT_IMPLEMENTED(- (instancetype)init)
+
+RCT_NOT_IMPLEMENTED(- (instancetype)initWithCoder:(NSCoder *)aDecoder)
+
+RCT_NOT_IMPLEMENTED(- (instancetype)initWithFrame:(CGRect)frame)
 
 - (void)updateWithImage:(UIImage *)image
 {
   if (!image) {
-    self.image = nil;
+    _imageView.image = nil;
     return;
   }
 
@@ -126,10 +129,10 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
   }
 
   // Apply trilinear filtering to smooth out mis-sized images
-  self.layer.minificationFilter = kCAFilterTrilinear;
-  self.layer.magnificationFilter = kCAFilterTrilinear;
+  _imageView.layer.minificationFilter = kCAFilterTrilinear;
+  _imageView.layer.magnificationFilter = kCAFilterTrilinear;
 
-  super.image = image;
+  _imageView.image = image;
 }
 
 - (void)setImage:(UIImage *)image
@@ -140,11 +143,15 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
   }
 }
 
+- (UIImage *)image {
+  return _imageView.image;
+}
+
 - (void)setBlurRadius:(CGFloat)blurRadius
 {
   if (blurRadius != _blurRadius) {
     _blurRadius = blurRadius;
-    [self reloadImage];
+    _needsReload = YES;
   }
 }
 
@@ -155,7 +162,7 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
         UIEdgeInsetsEqualToEdgeInsets(capInsets, UIEdgeInsetsZero)) {
       _capInsets = capInsets;
       // Need to reload image when enabling or disabling capInsets
-      [self reloadImage];
+      _needsReload = YES;
     } else {
       _capInsets = capInsets;
       [self updateWithImage:self.image];
@@ -175,7 +182,7 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
 {
   if (![imageSources isEqual:_imageSources]) {
     _imageSources = [imageSources copy];
-    [self reloadImage];
+    _needsReload = YES;
   }
 }
 
@@ -187,13 +194,13 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
     if (_resizeMode == RCTResizeModeRepeat) {
       // Repeat resize mode is handled by the UIImage. Use scale to fill
       // so the repeated image fills the UIImageView.
-      self.contentMode = UIViewContentModeScaleToFill;
+      _imageView.contentMode = UIViewContentModeScaleToFill;
     } else {
-      self.contentMode = (UIViewContentMode)resizeMode;
+      _imageView.contentMode = (UIViewContentMode)resizeMode;
     }
 
     if ([self shouldReloadImageSourceAfterResize]) {
-      [self reloadImage];
+      _needsReload = YES;
     }
   }
 }
@@ -212,8 +219,8 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
 - (void)clearImage
 {
   [self cancelImageLoad];
-  [self.layer removeAnimationForKey:@"contents"];
   self.image = nil;
+  _imageSource = nil;
 }
 
 - (void)clearImageIfDetached
@@ -276,6 +283,7 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
 - (void)reloadImage
 {
   [self cancelImageLoad];
+  _needsReload = NO;
 
   RCTImageSource *source = [self imageSourceForSize:self.frame.size];
   _pendingImageSource = source;
@@ -295,6 +303,11 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
       };
     }
 
+    __weak RCTImageView *weakSelf = self;
+    RCTImageLoaderPartialLoadBlock partialLoadHandler = ^(UIImage *image) {
+      [weakSelf imageLoaderLoadedImage:image error:nil forImageSource:source partial:YES];
+    };
+
     CGSize imageSize = self.bounds.size;
     CGFloat imageScale = RCTScreenScale();
     if (!UIEdgeInsetsEqualToEdgeInsets(_capInsets, UIEdgeInsetsZero)) {
@@ -303,25 +316,25 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
       imageScale = source.scale;
     }
 
-    __weak RCTImageView *weakSelf = self;
     RCTImageLoaderCompletionBlock completionHandler = ^(NSError *error, UIImage *loadedImage) {
-      [weakSelf imageLoaderLoadedImage:loadedImage error:error forImageSource:source];
+      [weakSelf imageLoaderLoadedImage:loadedImage error:error forImageSource:source partial:NO];
     };
 
     _reloadImageCancellationBlock =
-    [_bridge.imageLoader loadImageWithURLRequest:source.request
-                                            size:imageSize
-                                           scale:imageScale
-                                         clipped:NO
-                                      resizeMode:_resizeMode
-                                   progressBlock:progressHandler
-                                 completionBlock:completionHandler];
+    [[_bridge moduleForName:@"ImageLoader" lazilyLoadIfNecessary:YES] loadImageWithURLRequest:source.request
+                                                                        size:imageSize
+                                                                       scale:imageScale
+                                                                     clipped:NO
+                                                                  resizeMode:_resizeMode
+                                                               progressBlock:progressHandler
+                                                            partialLoadBlock:partialLoadHandler
+                                                             completionBlock:completionHandler];
   } else {
     [self clearImage];
   }
 }
 
-- (void)imageLoaderLoadedImage:(UIImage *)loadedImage error:(NSError *)error forImageSource:(RCTImageSource *)source
+- (void)imageLoaderLoadedImage:(UIImage *)loadedImage error:(NSError *)error forImageSource:(RCTImageSource *)source partial:(BOOL)isPartialLoad
 {
   if (![source isEqual:_pendingImageSource]) {
     // Bail out if source has changed since we started loading
@@ -329,6 +342,10 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
   }
 
   if (error) {
+    RCTExecuteOnMainQueue(^{
+      self.image = nil;
+    });
+
     if (_onError) {
       _onError(@{ @"error": error.localizedDescription });
     }
@@ -339,21 +356,25 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
   }
 
   void (^setImageBlock)(UIImage *) = ^(UIImage *image) {
-    self->_imageSource = source;
-    self->_pendingImageSource = nil;
+    if (!isPartialLoad) {
+      self->_imageSource = source;
+      self->_pendingImageSource = nil;
+    }
 
-    if (image.reactKeyframeAnimation) {
-      [self.layer addAnimation:image.reactKeyframeAnimation forKey:@"contents"];
+    self.image = image;
+
+    if (isPartialLoad) {
+      if (self->_onPartialLoad) {
+        self->_onPartialLoad(nil);
+      }
     } else {
-      [self.layer removeAnimationForKey:@"contents"];
-      self.image = image;
-    }
-
-    if (self->_onLoad) {
-      self->_onLoad(onLoadParamsForSource(source));
-    }
-    if (self->_onLoadEnd) {
-      self->_onLoadEnd(nil);
+      if (self->_onLoad) {
+        RCTImageSource *sourceLoaded = [source imageSourceWithSize:image.size scale:source.scale];
+        self->_onLoad(onLoadParamsForSource(sourceLoaded));
+      }
+      if (self->_onLoadEnd) {
+        self->_onLoadEnd(nil);
+      }
     }
   };
 
@@ -397,8 +418,8 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
       return;
     }
 
-    // Don't reload if the current image size is the maximum size of the image source
-    CGSize imageSourceSize = _imageSource.size;
+    // Don't reload if the current image size is the maximum size of either the pending image source or image source
+    CGSize imageSourceSize = (_imageSource ? _imageSource : _pendingImageSource).size;
     if (imageSize.width * imageScale == imageSourceSize.width * _imageSource.scale &&
         imageSize.height * imageScale == imageSourceSize.height * _imageSource.scale) {
       return;
@@ -409,6 +430,13 @@ RCT_NOT_IMPLEMENTED(- (instancetype)init)
     // If the existing image or an image being loaded are not the right
     // size, reload the asset in case there is a better size available.
     _targetSize = idealSize;
+    [self reloadImage];
+  }
+}
+
+- (void)didSetProps:(NSArray<NSString *> *)changedProps
+{
+  if (_needsReload) {
     [self reloadImage];
   }
 }
